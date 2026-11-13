@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Entry for make.fun polymarket-nvidia-ceo-forecast-01.
+"""Entry for make.fun polymarket-nvidia-ceo-forecast-01 (v2).
 
 For every market of Polymarket's "Next CEO of NVIDIA?" event this
 program forecasts the Yes price at each of the 240 minutes after a
@@ -10,32 +10,43 @@ market is the 1-minute price history inside the case file.
 The forecast blends two views of each market's last day of trading
 (the most recent 1,440 one-minute prices):
 
-- A robust random walk (weight 0.65). The median stays pinned to the
-  last price and the band widens like sigma * sqrt(h), where sigma is
-  estimated per market from the median absolute 1-minute move (scaled
-  by 1.4826 so it reads like a standard deviation, floored at 0.0002
-  so a frozen market still gets a hair of width). The two outer
-  quantiles are stretched threefold on top of that: these prices move
-  in jumps, not smooth steps, so a plain normal band is far too
-  confident about the tails.
+- A robust random walk (weight 0.65). Its band widens like
+  sigma * sqrt(h), where sigma is estimated per market from the
+  median absolute 1-minute move (scaled by 1.4826 so it reads like a
+  standard deviation, floored at 0.0002 so a frozen market still
+  gets a hair of width). The two outer quantiles are stretched
+  threefold on top of that: these prices move in jumps, not smooth
+  steps, so a plain normal band is far too confident about the
+  tails.
 
-- The market's own empirical record (weight 0.35). For a set of anchor
-  horizons, the actual distribution of h-minute price changes over the
-  window is read off directly, interpolated in sqrt(h) between
-  anchors, and recentered so its median sits on the last price. This
-  carries the real shape of the moves - long stillness, sudden spikes
-  - that no bell curve reproduces.
+- The market's own empirical record (weight 0.35). For a set of
+  anchor horizons, the actual distribution of h-minute price
+  changes over the window is read off directly, interpolated in
+  sqrt(h) between anchors, and recentered so its median sits on
+  the last price. This carries the real shape of the moves - long
+  stillness, sudden spikes - that no bell curve reproduces.
 
-Both members are clamped into [0, 1] before blending (a price cannot
-leave that range, so a member's overshoot is truncated where it lands
-rather than averaged back). The blended outer quantiles are then
-widened a further 15% away from the blended median, every row is
-clamped, rounded to 6 decimals and forced non-decreasing.
+Two refinements over the first version:
 
-Backtested on the competition's six practice cases with the house's
-pinball-loss scorer, this blend scores about 0.290 against the house
-baseline's 0.363589. Standard library only, no randomness, no clock:
-the same case always produces the same bytes.
+- The centre is no longer pinned exactly to the last price. A
+  short-horizon drift is estimated as an exponentially weighted
+  average of the recent 1-minute moves (half-life EWMA_HALFLIFE
+  minutes) and projected forward in a saturating way - the shift
+  grows like mu * h / (1 + h / DRIFT_TAU), so a burst of momentum
+  leans the median a little at short horizons and then stops
+  accumulating - and it is hard-capped at DRIFT_CAP_FRAC of the
+  horizon's own sigma_h, so the lean can never rival the band.
+
+- The blended outer quantiles are widened only 5% further away
+  from the median (the first version used 15%): the blend was
+  covering a touch more than it needed to.
+
+Both members are clamped into [0, 1] before blending (a price
+cannot leave that range, so a member's overshoot is truncated
+where it lands rather than averaged back). After the drift shift
+and the tail widening, every row is clamped, rounded to 6 decimals
+and forced non-decreasing. Standard library only, no randomness,
+no clock: the same case always produces the same bytes.
 """
 
 import json
@@ -47,9 +58,16 @@ WINDOW = 1440            # minutes of history each member looks at
 WALK_WEIGHT = 0.65
 RECORD_WEIGHT = 0.35
 TAIL_STRETCH = 3.0       # outer-quantile stretch inside the walk member
-TAIL_POST_SCALE = 1.15   # extra outer widening applied to the blend
+TAIL_POST_SCALE = 1.05   # extra outer widening applied to the blend
 SIGMA_FLOOR = 0.0002
 MAD_TO_SIGMA = 1.4826
+
+# Drift knobs: EWMA half-life of the 1-minute moves (minutes), the
+# saturation horizon of the projection (minutes), and the cap on
+# the median shift as a fraction of sigma * sqrt(h).
+EWMA_HALFLIFE = 15.0
+DRIFT_TAU = 20.0
+DRIFT_CAP_FRAC = 0.50
 
 # The five scored levels and the standard normal's quantiles at them
 # (the same tabulated values the house baseline uses).
@@ -94,18 +112,66 @@ def emp_quantile(ordered, q):
     return ordered[lo] + (ordered[hi] - ordered[lo]) * (pos - lo)
 
 
-def walk_rows(prices, horizon, taus):
-    """Robust random walk around the last price.
+def walk_sigma(prices):
+    """Per-market 1-minute sigma from the median absolute move.
 
-    sigma comes from the median absolute 1-minute change over the
-    window - a median, so the occasional news jump does not blow the
-    whole band up - and the outer quantiles are stretched by
-    TAIL_STRETCH before clamping.
+    A median, so the occasional news jump does not blow the band up;
+    scaled by MAD_TO_SIGMA so it reads like a standard deviation and
+    floored so a frozen market still gets a hair of width.
     """
     window = prices[-WINDOW:]
     steps = sorted(abs(window[i + 1] - window[i]) for i in range(len(window) - 1))
     mad = steps[len(steps) // 2] if steps else 0.0
-    sigma = max(MAD_TO_SIGMA * mad, SIGMA_FLOOR)
+    return max(MAD_TO_SIGMA * mad, SIGMA_FLOOR)
+
+
+def ewma_move(prices, halflife):
+    """Exponentially weighted average of the recent 1-minute moves.
+
+    Walks the window's price changes oldest to newest, each step
+    folding the newest change in with weight alpha and forgetting
+    with the complementary weight, so a change k minutes old
+    carries weight (1 - alpha)**k and the average move halves in
+    influence every `halflife` minutes. Signed on purpose: this is
+    the direction the market has lately been leaning.
+    """
+    window = prices[-WINDOW:]
+    if len(window) < 2:
+        return 0.0
+    alpha = 1.0 - 0.5 ** (1.0 / halflife)
+    avg = window[1] - window[0]
+    for i in range(1, len(window) - 1):
+        avg += alpha * ((window[i + 1] - window[i]) - avg)
+    return avg
+
+
+def drift_shift(mu, sigma, h):
+    """Median shift at horizon h from per-minute drift `mu`.
+
+    The raw projection mu * h would run away linearly; dividing by
+    (1 + h / DRIFT_TAU) makes it saturate - near h = DRIFT_TAU it
+    has delivered about half of its eventual total of mu * DRIFT_TAU.
+    The result is then capped at DRIFT_CAP_FRAC * sigma * sqrt(h):
+    the lean may use a fraction of the band's own width at that
+    horizon, never more.
+    """
+    raw = mu * h / (1.0 + h / DRIFT_TAU)
+    cap = DRIFT_CAP_FRAC * sigma * math.sqrt(h)
+    if raw > cap:
+        return cap
+    if raw < -cap:
+        return -cap
+    return raw
+
+
+def walk_rows(prices, horizon, taus):
+    """Robust random walk around the last price.
+
+    The median sits on the last price and the band widens like
+    sigma * sqrt(h); the outer quantiles are stretched by
+    TAIL_STRETCH before clamping.
+    """
+    sigma = walk_sigma(prices)
     x = prices[-1]
     zs = [z_at(t) for t in taus]
     last = len(zs) - 1
@@ -169,22 +235,26 @@ def record_rows(prices, horizon, taus):
 def forecast_market(market, horizon, taus):
     """Blend the two members into the final quantile rows.
 
-    A straight weighted mean per quantile (0.65 walk, 0.35 record),
-    then one last tail adjustment: the two outer quantiles are pushed
-    15% further away from the blended median, because even the blend
-    underestimates how often these markets jump several ticks at once.
-    The median itself is never moved by that push. Finally each row is
-    clamped to [0, 1], rounded, and swept left to right so the five
-    quantiles can never come out crossed.
+    A straight weighted mean per quantile (0.65 walk, 0.35 record).
+    The whole row is then shifted by the capped drift for that
+    horizon - a location shift, so the median leans with recent
+    momentum while the band's shape is untouched - and the two
+    outer quantiles are pushed TAIL_POST_SCALE further away from
+    the shifted median. Finally each row is clamped to [0, 1],
+    rounded, and swept left to right so the five quantiles can
+    never come out crossed.
     """
     prices = market["prices"]
     walk = walk_rows(prices, horizon, taus)
     record = record_rows(prices, horizon, taus)
+    sigma = walk_sigma(prices)
+    mu = ewma_move(prices, EWMA_HALFLIFE)
     mid = len(taus) // 2
     last = len(taus) - 1
     rows = []
     for h in range(horizon):
-        blended = [WALK_WEIGHT * walk[h][i] + RECORD_WEIGHT * record[h][i]
+        shift = drift_shift(mu, sigma, h + 1)
+        blended = [WALK_WEIGHT * walk[h][i] + RECORD_WEIGHT * record[h][i] + shift
                    for i in range(len(taus))]
         median = blended[mid]
         row = []
